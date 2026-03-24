@@ -1,5 +1,5 @@
 """
-AI Финансовый Агент v4.1 — исправленная обработка голоса и контекста
+AI Финансовый Агент v4.2 — исправленные модели и парсинг
 """
 import os
 import logging
@@ -43,34 +43,6 @@ class Expense:
     raw_text: str = ""
     confidence: float = 0.0
 
-    def to_dict(self):
-        return {
-            "amount": self.amount,
-            "currency": self.currency,
-            "category": self.category,
-            "description": self.description,
-            "date": self.date.strftime("%d.%m.%Y %H:%M"),
-            "raw_text": self.raw_text,
-            "confidence": self.confidence
-        }
-
-@dataclass
-class Debt:
-    id: str
-    name: str
-    amounts: List[Dict[str, Any]]
-    date: datetime
-    note: str = ""
-    reminder_date: Optional[datetime] = None
-
-@dataclass
-class UserContext:
-    last_expense: Optional[Expense] = None
-    last_debt: Optional[Debt] = None
-    conversation_history: List[Dict] = field(default_factory=list)
-    pending_action: Optional[str] = None
-    pending_data: Optional[Dict] = None  # Данные ожидающие подтверждения
-
 # ── КОНСТАНТЫ ────────────────────────────────────────────────────────────────
 CATEGORIES = ["Еда / продукты", "Транспорт", "Развлечения", "Здоровье / аптека", "Никотин", "Другое"]
 
@@ -79,80 +51,89 @@ CATEGORY_EMOJIS = {
     "Здоровье / аптека": "💊", "Никотин": "🚬", "Другое": "📦"
 }
 
-CURRENCY_SYMBOLS = {"UAH": "₴", "USD": "$", "EUR": "€", "GBP": "£"}
+CURRENCY_SYMBOLS = {"UAH": "₴", "USD": "$", "EUR": "€"}
 CURRENCY_NAMES = {
     "грн": "UAH", "гривен": "UAH", "гривна": "UAH", "гривны": "UAH", "₴": "UAH",
     "доллар": "USD", "доллара": "USD", "долларов": "USD", "бакс": "USD", "бакса": "USD", 
-    "баксов": "USD", "$": "USD", "евро": "EUR", "€": "EUR", "eur": "EUR", "usd": "USD"
+    "баксов": "USD", "$": "USD", "usd": "USD",
+    "евро": "EUR", "€": "EUR", "eur": "EUR"
 }
 
-MONTH_NAMES = ["Январь","Февраль","Март","Апрель","Май","Июнь",
-               "Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
-
 # Глобальное хранилище
-user_contexts: Dict[int, UserContext] = {}
+user_contexts: Dict[int, dict] = {}
 
-# ── AI SYSTEM PROMPT ─────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """Ты — интеллектуальный финансовый ассистент. Анализируй текст пользователя и извлекай финансовые операции.
-
-ВАЖНЫЕ ПРАВИЛА:
-1. МОЖЕТ быть несколько трат в одном сообщении! Каждую трату отдельным объектом.
-2. Даты: "сегодня", "вчера", "3 дня назад", "15 марта" → ISO формат
-3. Валюты: грн/₴/UAH, доллары/баксы/$, евро/€/EUR
-4. Категории определяй по смыслу, не только по ключевым словам:
-   - "снюсик", "снюс", "сигареты", "вейп" → Никотин
-   - "топливо", "бензин", "дизель", "заправка" → Транспорт
-   - "кофе", "ресторан", "продукты" → Еда
-   - "Steam", "игры", "подписка" → Развлечения
-
-5. Типы операций:
-   - expense: обычная трата
-   - debt_new: "дал в долг", "одолжил"
-   - debt_payment: "вернул", "отдал долг"
-   - budget_set: "бюджет 20000"
-   - salary_set: "зарплата 25 числа"
-   - query: вопросы о статистике
-
-Верни JSON:
-{
-  "intent": "expense|debt_new|debt_payment|budget_set|salary_set|query|clarify",
-  "items": [{"amount": число, "currency": "UAH|USD|EUR", "category": "...", "description": "...", "date": "ISO"}], 
-  "data": {},
-  "confidence": 0.0-1.0,
-  "needs_clarification": false,
-  "clarification_question": null
-}"""
-
-def get_user_context(chat_id: int) -> UserContext:
+def get_user_context(chat_id: int):
     if chat_id not in user_contexts:
-        user_contexts[chat_id] = UserContext()
+        user_contexts[chat_id] = {
+            "last_expense": None,
+            "pending_action": None,
+            "history": []
+        }
     return user_contexts[chat_id]
 
+# ── AI PARSING ─────────────────────────────────────────────────────────────
+
+# ИСПРАВЛЕНО: устаревшая модель заменена на актуальную
+AI_MODEL = "llama-3.3-70b-versatile"  # или "llama-3.1-8b-instant" для скорости
+
+SYSTEM_PROMPT = """Ты — финансовый ассистент. Извлеки ВСЕ траты из текста.
+
+КРИТИЧЕСКИ ВАЖНО:
+1. Каждая трата — отдельный объект в массиве items
+2. Для КАЖДОЙ траты определи свою категорию и описание по контексту
+3. Примеры:
+   - "600 на снюс и 850 на топливо" → 
+     [{"amount":600,"desc":"снюс","cat":"Никотин"}, {"amount":850,"desc":"топливо","cat":"Транспорт"}]
+   - "кофе 150 и булочку 80" → 
+     [{"amount":150,"desc":"кофе","cat":"Еда / продукты"}, {"amount":80,"desc":"булочка","cat":"Еда / продукты"}]
+
+Категории: Еда / продукты, Транспорт, Развлечения, Здоровье / аптека, Никотин, Другое
+
+Правила категорий:
+- Никотин: снюс, сигареты, вейп, кальян, табак
+- Транспорт: бензин, топливо, заправка, такси, метро, мойка машины, парковка
+- Еда: кофе, ресторан, продукты, еда, булочка, пицца
+- Развлечения: кино, игры, steam, подписка
+- Здоровье: аптека, лекарства, врач
+
+Верни строго JSON:
+{
+  "intent": "expense",
+  "items": [
+    {
+      "amount": число,
+      "currency": "UAH|USD|EUR", 
+      "category": "категория",
+      "description": "конкретное описание из текста",
+      "date": "YYYY-MM-DD"
+    }
+  ],
+  "confidence": 0.0-1.0
+}"""
+
 async def ai_parse(text: str, chat_id: int) -> Dict:
-    """AI-парсинг текста"""
-    user_ctx = get_user_context(chat_id)
+    """AI-парсинг с fallback"""
+    ctx = get_user_context(chat_id)
     
-    # Контекст истории
+    # Добавляем историю для контекста
     history = ""
-    if user_ctx.conversation_history:
-        recent = user_ctx.conversation_history[-3:]
-        history = "\n".join([f"Было: {h['user']} → {h.get('ai_response', 'ok')}" for h in recent])
+    if ctx["history"]:
+        recent = ctx["history"][-2:]
+        history = "Последние сообщения:\n" + "\n".join([f"- {h['text'][:50]}" for h in recent])
     
     prompt = f"""{SYSTEM_PROMPT}
 
-ИСТОРИЯ:
 {history}
 
-СООБЩЕНИЕ: "{text}"
+Текущее сообщение: "{text}"
 
-Верни только JSON без комментариев."""
+Верни только JSON."""
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
+            model=AI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=800,
+            max_tokens=600,
             temperature=0.1,
             response_format={"type": "json_object"}
         )
@@ -160,96 +141,110 @@ async def ai_parse(text: str, chat_id: int) -> Dict:
         result = json.loads(response.choices[0].message.content)
         
         # Сохраняем историю
-        user_ctx.conversation_history.append({
-            "user": text,
-            "ai_response": result.get("intent", "unknown"),
-            "timestamp": datetime.now().isoformat()
+        ctx["history"].append({
+            "text": text,
+            "parsed": result.get("items", []),
+            "time": datetime.now().isoformat()
         })
-        if len(user_ctx.conversation_history) > 10:
-            user_ctx.conversation_history = user_ctx.conversation_history[-10:]
+        if len(ctx["history"]) > 5:
+            ctx["history"] = ctx["history"][-5:]
         
         return result
         
     except Exception as e:
         logger.error(f"AI parse error: {e}")
-        # Fallback
-        return fallback_parse(text)
+        return smart_fallback_parse(text)
 
-def fallback_parse(text: str) -> Dict:
-    """Резервный парсер"""
+def smart_fallback_parse(text: str) -> Dict:
+    """Умный fallback парсер — ищет пары сумма+описание"""
     text_lower = text.lower()
-    
-    # Ищем все числа с контекстом
-    pattern = r'(\d+(?:[.,]\d+)?)\s*(грн|гривен|₴|долларов|баксов|\$|евро|€)?'
-    matches = re.findall(pattern, text_lower)
-    
     items = []
-    for num_str, curr in matches:
-        amount = float(num_str.replace(",", "."))
+    
+    # Паттерн: сумма + валюта + предлог + описание
+    # "600 гривен на снюсик", "850 на топливо", "150 за кофе"
+    pattern = r'(\d+(?:[.,]\d+)?)\s*(?:грн|гривен|₴|долларов|баксов|\$|евро|€)?\s*(?:на|за|в|для|в\s+)?\s*([^,\.и\d][^,\.]*?)(?=\s*(?:и|,|\.|\d|$))'
+    
+    matches = list(re.finditer(pattern, text_lower))
+    
+    for match in matches:
+        amount_str = match.group(1).replace(",", ".")
+        amount = float(amount_str)
+        desc_raw = match.group(2).strip()
+        
+        # Очищаем описание
+        desc = re.sub(r'\s+(?:и|а|но|или)\s+.*$', '', desc_raw).strip()
+        if len(desc) > 30:
+            desc = desc[:30]
+        
+        # Определяем валюту
         currency = "UAH"
-        if curr in ["долларов", "баксов", "$"]:
+        if any(x in text_lower[max(0, match.start()-10):match.start()] for x in ["доллар", "бакс", "$", "usd"]):
             currency = "USD"
-        elif curr in ["евро", "€"]:
+        elif any(x in text_lower[max(0, match.start()-10):match.start()] for x in ["евро", "€", "eur"]):
             currency = "EUR"
         
-        # Определяем категорию по ближайшим словам
+        # Определяем категорию по описанию
         category = "Другое"
-        desc = "трата"
+        desc_lower = desc.lower()
         
-        cat_keywords = {
-            "Никотин": ["снюс", "сигарет", "вейп", "кальян", "табак"],
-            "Транспорт": ["бензин", "топливо", "заправка", "такси", "метро", "автобус"],
-            "Еда / продукты": ["еда", "кафе", "ресторан", "продукты", "кофе", "пицца"],
-            "Развлечения": ["кино", "игра", "steam", "подписка", "бар"],
-            "Здоровье / аптека": ["аптека", "лекарств", "врач"]
-        }
-        
-        for cat, keywords in cat_keywords.items():
-            if any(kw in text_lower for kw in keywords):
-                category = cat
-                desc = next((kw for kw in keywords if kw in text_lower), "трата")
-                break
+        if any(w in desc_lower for w in ["снюс", "сигарет", "вейп", "кальян", "табак", "никотин"]):
+            category = "Никотин"
+        elif any(w in desc_lower for w in ["бензин", "топливо", "заправка", "такси", "метро", "мойка", "парковка", "транспорт", "машин"]):
+            category = "Транспорт"
+        elif any(w in desc_lower for w in ["кофе", "кафе", "ресторан", "еду", "пицца", "булочка", "продукты", "обед", "ужин", "завтрак", "гамбургер", "шаурма"]):
+            category = "Еда / продукты"
+        elif any(w in desc_lower for w in ["кино", "игра", "steam", "подписка", "бар", "клуб", "развлеч"]):
+            category = "Развлечения"
+        elif any(w in desc_lower for w in ["аптека", "лекарств", "врач", "больница", "анализ", "здоровье"]):
+            category = "Здоровье / аптека"
         
         items.append({
             "amount": amount,
             "currency": currency,
             "category": category,
-            "description": desc,
-            "date": datetime.now().isoformat()
+            "description": desc.capitalize(),
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "confidence": 0.7
         })
+    
+    # Если не нашли паттерном, ищем просто числа
+    if not items:
+        numbers = re.findall(r'(\d+(?:[.,]\d+)?)\s*(?:грн|₴)?', text_lower)
+        if numbers:
+            # Одно число без контекста
+            items.append({
+                "amount": float(numbers[0].replace(",", ".")),
+                "currency": "UAH",
+                "category": "Другое",
+                "description": "трата",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "confidence": 0.5
+            })
     
     return {
         "intent": "expense",
         "items": items,
-        "data": {},
-        "confidence": 0.6,
-        "needs_clarification": len(items) == 0,
-        "clarification_question": "Не нашёл сумму. Напиши: «Снюс 800»" if len(items) == 0 else None
+        "confidence": 0.7 if items else 0.3
     }
 
 # ── DATE PARSING ─────────────────────────────────────────────────────────────
 
-def parse_smart_date(text: str) -> datetime:
-    """Умный парсер дат"""
+def parse_date(text: str) -> datetime:
+    """Парсер дат"""
     text_lower = text.lower()
     now = datetime.now()
     
-    # Сегодня/вчера/позавчера
     if any(w in text_lower for w in ["сегодня", "сьогодні"]):
         return now
     if any(w in text_lower for w in ["вчера", "вчора"]):
         return now - timedelta(days=1)
-    if "позавчера" in text_lower or "позавчора" in text_lower:
+    if "позавчера" in text_lower:
         return now - timedelta(days=2)
     
     # "N дней назад"
     match = re.search(r'(\d+)\s*дн[яеяй]\s*назад', text_lower)
     if match:
         return now - timedelta(days=int(match.group(1)))
-    
-    # "на прошлой неделе"
-    if "прошл" in text_lower and "недел" in text_lower:
-        return now - timedelta(days=7)
     
     # Дни недели
     days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -259,18 +254,6 @@ def parse_smart_date(text: str) -> datetime:
             if diff == 0:
                 diff = 7
             return now - timedelta(days=diff)
-    
-    # Форматы дат ДД.ММ.ГГГГ или ДД.ММ
-    date_match = re.search(r'(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?', text_lower)
-    if date_match:
-        d, m, y = date_match.groups()
-        year = int(y) if y else now.year
-        if year < 100:
-            year += 2000
-        try:
-            return datetime(year, int(m), int(d))
-        except:
-            pass
     
     return now
 
@@ -304,30 +287,25 @@ def get_sheet(name="Expenses"):
         return sp.add_worksheet(title=name, rows=1000, cols=10)
 
 def init_db():
-    """Инициализация таблиц"""
     sp = get_spreadsheet()
-    sheets = ["Expenses", "Debts", "Settings"]
-    for name in sheets:
+    sheets = ["Expenses", "Settings"]
+    for s in sheets:
         try:
-            sp.worksheet(name)
+            sp.worksheet(s)
         except:
-            ws = sp.add_worksheet(title=name, rows=1000, cols=10)
-            if name == "Expenses":
-                ws.append_row(["Дата", "Сумма", "Валюта", "Категория", "Описание", "Raw Text", "User ID", "Timestamp"])
-            elif name == "Debts":
-                ws.append_row(["ID", "Кому", "Суммы JSON", "Дата", "Статус", "Примечание", "User ID"])
-            elif name == "Settings":
-                ws.append_row(["User ID", "Key", "Value", "Updated"])
+            ws = sp.add_worksheet(title=s, rows=1000, cols=10)
+            if s == "Expenses":
+                ws.append_row(["Дата", "Сумма", "Валюта", "Категория", "Описание", "Raw", "UserID", "Time"])
 
-def save_expense(expense: Expense, user_id: int):
+def save_expense(exp: Expense, user_id: int):
     ws = get_sheet("Expenses")
     ws.append_row([
-        expense.date.strftime("%d.%m.%Y %H:%M"),
-        expense.amount,
-        expense.currency,
-        expense.category,
-        expense.description,
-        expense.raw_text,
+        exp.date.strftime("%d.%m.%Y %H:%M"),
+        exp.amount,
+        exp.currency,
+        exp.category,
+        exp.description,
+        exp.raw_text[:100],
         str(user_id),
         datetime.now().isoformat()
     ])
@@ -343,176 +321,186 @@ def get_expenses(user_id: int, days: int = 30) -> List[Dict]:
     result = []
     
     for r in records:
-        if str(r.get("User ID")) != str(user_id):
+        if str(r.get("UserID")) != str(user_id):
             continue
         try:
-            date_str = r.get("Дата", "")
-            if not date_str:
-                continue
-            date = datetime.strptime(date_str[:10], "%d.%m.%Y")
-            if date >= cutoff:
+            d = datetime.strptime(r["Дата"][:10], "%d.%m.%Y")
+            if d >= cutoff:
                 result.append(r)
-        except Exception as e:
+        except:
             continue
-    
     return result
 
 def save_setting(user_id: int, key: str, value: str):
     ws = get_sheet("Settings")
-    records = ws.get_all_records()
-    for i, r in enumerate(records, start=2):
-        if str(r.get("User ID")) == str(user_id) and r.get("Key") == key:
-            ws.update_cell(i, 3, value)
-            ws.update_cell(i, 4, datetime.now().isoformat())
-            return
-    ws.append_row([str(user_id), key, value, datetime.now().isoformat()])
+    try:
+        records = ws.get_all_records()
+        for i, r in enumerate(records, start=2):
+            if str(r.get("UserID")) == str(user_id) and r.get("Key") == key:
+                ws.update_cell(i, 3, value)
+                return
+    except:
+        pass
+    ws.append_row([str(user_id), key, value])
 
 def get_settings(user_id: int) -> Dict:
     try:
         ws = get_sheet("Settings")
         records = ws.get_all_records()
-        return {r["Key"]: r["Value"] for r in records if str(r.get("User ID")) == str(user_id)}
+        return {r["Key"]: r["Value"] for r in records if str(r.get("UserID")) == str(user_id)}
     except:
         return {}
 
-# ── CORE LOGIC ───────────────────────────────────────────────────────────────
+# ── PROCESSING ───────────────────────────────────────────────────────────────
 
-async def process_expenses_batch(update: Update, context: ContextTypes.DEFAULT_TYPE, items: List[Dict], raw_text: str):
-    """Обработка нескольких трат сразу"""
+async def process_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE, items: List[Dict], raw_text: str):
+    """Обработка списка трат"""
     chat_id = update.effective_chat.id
-    user_ctx = get_user_context(chat_id)
     
-    expenses = []
+    if not items:
+        await update.message.reply_text("🤔 Не нашёл сумму. Попробуй: «Снюс 800»")
+        return
+    
     lines = ["✅ *Записано!*\n"]
+    total_uah = 0
     
     for item in items:
-        # Определяем дату
-        date_str = item.get("date")
-        if date_str:
-            try:
-                exp_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-            except:
-                exp_date = parse_smart_date(raw_text)
-        else:
-            exp_date = parse_smart_date(raw_text)
+        # Парсим дату
+        date_str = item.get("date", datetime.now().strftime("%Y-%m-%d"))
+        try:
+            exp_date = datetime.fromisoformat(date_str)
+        except:
+            exp_date = parse_date(raw_text)
         
-        expense = Expense(
+        exp = Expense(
             amount=float(item.get("amount", 0)),
             currency=item.get("currency", "UAH"),
             category=item.get("category", "Другое"),
             description=item.get("description", "трата"),
             date=exp_date,
-            raw_text=raw_text[:100],
-            confidence=item.get("confidence", 0.8)
+            raw_text=raw_text
         )
         
-        # Если уверенность низкая — запрашиваем подтверждение категории
-        if expense.confidence < 0.7 and len(items) == 1:
-            user_ctx.last_expense = expense
-            user_ctx.pending_action = "confirm_category"
-            
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{cat}", callback_data=f"confirm_cat_{i}_{cat}")]
-                for i, cat in enumerate(CATEGORIES)
-            ])
-            await update.message.reply_text(
-                f"🤔 *{expense.amount:,.0f} {CURRENCY_SYMBOLS.get(expense.currency, '₴')}* — {expense.description}\n"
-                f"Какая категория?",
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
-            return
+        save_expense(exp, chat_id)
         
-        save_expense(expense, chat_id)
-        expenses.append(expense)
+        emoji = CATEGORY_EMOJIS.get(exp.category, "💰")
+        symbol = CURRENCY_SYMBOLS.get(exp.currency, "₴")
+        lines.append(f"{emoji} {exp.description}: *{exp.amount:,.0f} {symbol}* ({exp.category})")
         
-        emoji = CATEGORY_EMOJIS.get(expense.category, "💰")
-        lines.append(f"{emoji} {expense.description}: *{expense.amount:,.0f} {CURRENCY_SYMBOLS.get(expense.currency, '₴')}* ({expense.category})")
+        if exp.currency == "UAH":
+            total_uah += exp.amount
     
-    # Итог
-    if len(expenses) > 1:
-        total = sum(e.amount for e in expenses if e.currency == "UAH")
-        lines.append(f"\n💰 *Итого: {total:,.0f} ₴*")
+    if len(items) > 1:
+        lines.append(f"\n💰 *Итого: {total_uah:,.0f} ₴*")
     
     # Проверка бюджета
     settings = get_settings(chat_id)
     budget = float(settings.get("monthly_budget", 0))
     if budget > 0:
-        month_expenses = get_expenses(chat_id, 30)
-        spent = sum(float(r["Сумма"]) for r in month_expenses if r.get("Валюта") == "UAH")
+        month_exp = get_expenses(chat_id, 30)
+        spent = sum(float(r["Сумма"]) for r in month_exp if r.get("Валюта") == "UAH")
         pct = min(int(spent / budget * 100), 100)
         if pct >= 90:
             lines.append(f"\n🔴 *Бюджет на {pct}%!*")
-        elif pct >= 75:
+        elif pct >= 70:
             lines.append(f"\n🟡 Бюджет на {pct}%")
     
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def process_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Главный обработчик намерений"""
+    """Главный обработчик"""
     chat_id = update.effective_chat.id
+    ctx = get_user_context(chat_id)
     
-    # Проверяем pending действия
-    user_ctx = get_user_context(chat_id)
-    if user_ctx.pending_action == "confirm_category" and user_ctx.last_expense:
-        # Если пришёл текст во время ожидания категории — используем как категорию
+    # Проверяем ожидание подтверждения категории
+    if ctx["pending_action"] == "confirm_cat" and ctx["last_expense"]:
         cat = text.strip()
         if cat in CATEGORIES:
-            user_ctx.last_expense.category = cat
-            save_expense(user_ctx.last_expense, chat_id)
+            ctx["last_expense"].category = cat
+            save_expense(ctx["last_expense"], chat_id)
+            emoji = CATEGORY_EMOJIS.get(cat, "💰")
             await update.message.reply_text(
-                f"✅ Записано: {user_ctx.last_expense.amount:,.0f} ₴ → {cat}",
+                f"✅ {emoji} {cat}: *{ctx['last_expense'].amount:,.0f} ₴*",
                 parse_mode="Markdown"
             )
-            user_ctx.pending_action = None
-            user_ctx.last_expense = None
+            ctx["pending_action"] = None
+            ctx["last_expense"] = None
             return
     
     # AI парсинг
     parsed = await ai_parse(text, chat_id)
-    
     intent = parsed.get("intent", "unknown")
     items = parsed.get("items", [])
     
-    if intent == "expense" and items:
-        await process_expenses_batch(update, context, items, text)
-    elif intent == "budget_set":
-        amount = parsed.get("data", {}).get("amount") or items[0]["amount"] if items else 0
-        save_setting(chat_id, "monthly_budget", str(amount))
-        await update.message.reply_text(f"💰 Бюджет установлен: *{amount:,.0f} ₴/мес*", parse_mode="Markdown")
-    elif intent == "salary_set":
-        day = parsed.get("data", {}).get("day", 25)
-        amount = parsed.get("data", {}).get("amount")
-        save_setting(chat_id, "salary_day", str(day))
-        if amount:
-            save_setting(chat_id, "salary_amount", str(amount))
-        msg = f"💵 Зарплата: *{day}-е число*"
-        if amount:
-            msg += f", {amount:,.0f} ₴"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    elif intent == "query":
-        await handle_query(update, context, parsed.get("data", {}))
-    elif parsed.get("needs_clarification"):
-        await update.message.reply_text(f"🤔 {parsed.get('clarification_question')}")
-    else:
-        # Свободный диалог
-        await handle_conversation(update, context, text)
-
-async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, data: Dict):
-    """Обработка запросов статистики"""
-    chat_id = update.effective_chat.id
-    query_type = data.get("type", "month")
+    if intent == "expense":
+        # Если уверенность низкая и одна трата — спрашиваем категорию
+        if parsed.get("confidence", 1) < 0.6 and len(items) == 1:
+            exp = Expense(
+                amount=items[0]["amount"],
+                currency=items[0].get("currency", "UAH"),
+                description=items[0].get("description", "трата")
+            )
+            ctx["last_expense"] = exp
+            ctx["pending_action"] = "confirm_cat"
+            
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(cat, callback_data=f"cat_{cat}")] 
+                for cat in CATEGORIES
+            ])
+            await update.message.reply_text(
+                f"🤔 *{exp.amount:,.0f} ₴* — {exp.description}\nКакая категория?",
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+            return
+        
+        await process_expenses(update, context, items, text)
     
-    if query_type == "week":
-        days = 7
-        title = "📅 *Неделя*"
+    elif intent == "budget_set":
+        amt = items[0]["amount"] if items else 0
+        save_setting(chat_id, "monthly_budget", str(amt))
+        await update.message.reply_text(f"💰 Бюджет: *{amt:,.0f} ₴/мес*", parse_mode="Markdown")
+    
+    elif intent == "salary_set":
+        day = 25  # default
+        amt = None
+        nums = re.findall(r'\d+', text)
+        if nums:
+            day = int(nums[0])
+            if len(nums) > 1:
+                amt = float(nums[1])
+        save_setting(chat_id, "salary_day", str(day))
+        if amt:
+            save_setting(chat_id, "salary_amount", str(amt))
+        msg = f"💵 Зарплата: *{day}-е число*"
+        if amt:
+            msg += f", {amt:,.0f} ₴"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    
     else:
-        days = 30
-        title = "📆 *Месяц*"
+        # Запрос статистики или непонятно
+        if any(w in text.lower() for w in ["сколько", "статус", "отчёт", "анализ", "тратил"]):
+            await show_stats(update, context, text)
+        else:
+            await update.message.reply_text(
+                "🤔 Не понял. Примеры:\n"
+                "• «Снюс 800, бензин 1200»\n"
+                "• «Вчера кофе 150»\n"
+                "• «Бюджет 20000»"
+            )
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Показ статистики"""
+    chat_id = update.effective_chat.id
+    
+    # Определяем период
+    days = 30
+    if any(w in text.lower() for w in ["недел", "week", "7 дн"]):
+        days = 7
     
     expenses = get_expenses(chat_id, days)
     if not expenses:
-        await update.message.reply_text("📭 Нет данных за этот период.")
+        await update.message.reply_text("📭 Нет данных.")
         return
     
     total = sum(float(r["Сумма"]) for r in expenses)
@@ -520,9 +508,11 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, data:
     for r in expenses:
         by_cat[r["Категория"]] += float(r["Сумма"])
     
-    lines = [title, f"\n💰 *{total:,.0f} ₴* всего\n", "*По категориям:*"]
+    period = "неделю" if days == 7 else "месяц"
+    lines = [f"📊 *За {period}*\n", f"💰 *{total:,.0f} ₴* всего\n", "*По категориям:*"]
+    
     for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1]):
-        pct = int(amt / total * 100)
+        pct = int(amt / total * 100) if total > 0 else 0
         emoji = CATEGORY_EMOJIS.get(cat, "•")
         lines.append(f"{emoji} {cat}: {amt:,.0f} ₴ ({pct}%)")
     
@@ -530,70 +520,40 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, data:
     budget = float(settings.get("monthly_budget", 0))
     if budget > 0 and days == 30:
         left = budget - total
-        lines.append(f"\n💳 Бюджет: {budget:,.0f} ₴\n📉 Осталось: {left:,.0f} ₴")
+        pct = min(int(total / budget * 100), 100)
+        lines.append(f"\n💳 Бюджет: {pct}%\n📉 Осталось: {left:,.0f} ₴")
     
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Свободный диалог через AI"""
-    chat_id = update.effective_chat.id
-    
-    # Получаем контекст для ответа
-    expenses = get_expenses(chat_id, 7)
-    total_week = sum(float(r["Сумма"]) for r in expenses)
-    
-    prompt = f"""Ты — дружелюбный финансовый помощник. Ответь кратко, по-человечески, с эмодзи.
-
-Контекст пользователя:
-- Потрачено за неделю: {total_week:,.0f} ₴
-
-Вопрос: {text}
-
-Дай полезный ответ. Если это не финансовый вопрос — вежливо направь к теме финансов."""
-
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
-            temperature=0.7
-        )
-        await update.message.reply_text(response.choices[0].message.content)
-    except Exception as e:
-        logger.error(f"Conv error: {e}")
-        await update.message.reply_text("🤔 Не совсем понял. Попробуй: «Снюс 800» или «Сколько потратил?»")
 
 # ── HANDLERS ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *AI Финансовый Агент*\n\n"
-        "🎙 Голосом или текстом — я пойму всё:\n"
-        "• «600 на снюс и 850 бензина»\n"
-        "• «Вчера в кафе потратил 1200»\n"
-        "• «Сколько ушло на этой неделе?»\n\n"
-        "Просто напиши или скажи!",
+        "👋 *AI Финансовый Агент v4.2*\n\n"
+        "Просто напиши или скажи голосом:\n"
+        "• «600 на снюс и 850 на топливо»\n"
+        "• «Вчера кофе 150, сегодня такси 80»\n"
+        "• «Сколько потратил на неделе?»\n\n"
+        "Я пойму контекст и разделю на категории!",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup([
             [KeyboardButton("📊 Статус"), KeyboardButton("💰 Бюджет")],
-            [KeyboardButton("📈 Анализ"), KeyboardButton("⚙️ Настройки")]
+            [KeyboardButton("📈 Анализ"), KeyboardButton("❓ Помощь")]
         ], resize_keyboard=True)
     )
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Исправленная обработка голоса"""
-    processing_msg = await update.message.reply_text("🎙 Распознаю...")
+    """Обработка голоса"""
+    msg = await update.message.reply_text("🎙 Распознаю...")
     
     try:
-        # Скачиваем файл
         file = await context.bot.get_file(update.message.voice.file_id)
         
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             await file.download_to_drive(tmp.name)
-            voice_path = tmp.name
+            path = tmp.name
         
-        # Распознаём через Whisper
-        with open(voice_path, "rb") as f:
+        with open(path, "rb") as f:
             transcript = groq_client.audio.transcriptions.create(
                 model="whisper-large-v3",
                 file=f,
@@ -601,73 +561,71 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response_format="text"
             )
         
-        # Удаляем временный файл
-        os.unlink(voice_path)
+        os.unlink(path)
         
         text = str(transcript).strip()
-        logger.info(f"Voice recognized: {text}")
+        logger.info(f"Voice: {text}")
         
-        # Показываем что распознали
-        await processing_msg.edit_text(f"📝 _{text}_", parse_mode="Markdown")
+        await msg.edit_text(f"📝 _{text}_", parse_mode="Markdown")
         
-        # Обрабатываем распознанный текст как обычное сообщение
-        # НЕ используем рекурсию, а вызываем process_intent напрямую
+        # Обрабатываем распознанный текст
         await process_intent(update, context, text)
         
     except Exception as e:
-        logger.error(f"Voice processing error: {e}")
-        await processing_msg.edit_text("❌ Не удалось распознать. Попробуй текстом.")
+        logger.error(f"Voice error: {e}")
+        await msg.edit_text("❌ Ошибка распознавания. Попробуй текстом.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текста"""
+    """Обработка текста и кнопок"""
     text = update.message.text
     
-    # Обработка кнопок меню
+    # Кнопки меню
     if text == "📊 Статус":
-        await handle_query(update, context, {"type": "month"})
+        await show_stats(update, context, "месяц")
         return
     if text == "📈 Анализ":
-        await handle_query(update, context, {"type": "week"})
+        await show_stats(update, context, "неделя")
         return
     if text == "💰 Бюджет":
         await update.message.reply_text("Напиши: «Бюджет 25000»")
         return
-    if text == "⚙️ Настройки":
-        await update.message.reply_text("Настройки: «Зарплата 25 числа 35000»")
+    if text == "❓ Помощь":
+        await update.message.reply_text(
+            "📝 *Примеры сообщений:*\n\n"
+            "• «Снюс 800» — одна трата\n"
+            "• «600 на снюс и 850 на бензин» — две траты\n"
+            "• «Вчера кофе 150» — с датой\n"
+            "• «Бюджет 20000» — установить бюджет\n"
+            "• «Зарплата 25 числа» — день зарплаты\n"
+            "• «Сколько потратил?» — статистика",
+            parse_mode="Markdown"
+        )
         return
     
     await process_intent(update, context, text)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка inline кнопок"""
+    """Inline кнопки"""
     query = update.callback_query
     await query.answer()
     data = query.data
     
-    if data.startswith("confirm_cat_"):
-        parts = data.split("_")
-        cat = parts[2]
-        
+    if data.startswith("cat_"):
+        cat = data[4:]
         chat_id = query.message.chat_id
-        user_ctx = get_user_context(chat_id)
+        ctx = get_user_context(chat_id)
         
-        if user_ctx.last_expense and user_ctx.pending_action == "confirm_category":
-            user_ctx.last_expense.category = cat
-            save_expense(user_ctx.last_expense, chat_id)
-            
-            exp = user_ctx.last_expense
+        if ctx["pending_action"] == "confirm_cat" and ctx["last_expense"]:
+            ctx["last_expense"].category = cat
+            save_expense(ctx["last_expense"], chat_id)
             emoji = CATEGORY_EMOJIS.get(cat, "💰")
             
             await query.edit_message_text(
-                f"✅ Записано!\n\n"
-                f"{emoji} {cat}\n"
-                f"💵 {exp.amount:,.0f} {CURRENCY_SYMBOLS.get(exp.currency, '₴')}\n"
-                f"📝 {exp.description}",
+                f"✅ {emoji} {cat}: *{ctx['last_expense'].amount:,.0f} ₴* ({ctx['last_expense'].description})",
                 parse_mode="Markdown"
             )
-            
-            user_ctx.pending_action = None
-            user_ctx.last_expense = None
+            ctx["pending_action"] = None
+            ctx["last_expense"] = None
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 
@@ -681,7 +639,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("AI Агент v4.1 запущен!")
+    logger.info(f"AI Агент v4.2 запущен! Модель: {AI_MODEL}")
     app.run_polling()
 
 if __name__ == "__main__":
