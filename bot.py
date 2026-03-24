@@ -635,7 +635,8 @@ def get_all_memory(user_id: int) -> Dict[str, str]:
     except Exception as e:
         logger.error(f"Get all memory error: {e}")
         return {}
-    # ANALYTICS FUNCTIONS ─────────────────────────────────────────────────────
+
+# ── ANALYTICS FUNCTIONS ─────────────────────────────────────────────────────
 
 def analyze_expenses(records: List[Dict]) -> Dict:
     """Анализ трат"""
@@ -755,7 +756,7 @@ def get_salary_status(user_id: int) -> Optional[Dict]:
     
     return result
 
-# ── AI INSIGHTS ─────────────────────────────────────────────────────────────--
+# ── AI INSIGHTS ─────────────────────────────────────────────────────────────
 
 async def generate_ai_insight(user_id: int) -> str:
     """Генерация AI-инсайта на основе данных"""
