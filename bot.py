@@ -1227,9 +1227,12 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     chat_id = update.effective_chat.id
     user_ctx = get_user_context(chat_id)
     
-    # Проверяем ожидающие действия
+    logger.info(f"Processing message: '{text[:50]}...'")
+    
+    # Проверяем ожидающие действия ПЕРВЫМ ДЕЛОМ
     if user_ctx.get("pending_action"):
         action = user_ctx["pending_action"]
+        logger.info(f"Pending action: {action}")
         
         if action == "confirm_category" and user_ctx.get("last_expense"):
             cat = text.strip()
@@ -1250,12 +1253,46 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             else:
                 await update.message.reply_text(f"Выбери категорию из списка: {', '.join(CATEGORIES)}")
                 return
-        
-        elif action == "confirm_debt_name" and user_ctx.get("pending_debt"):
-            # Уточнение имени для долга
-            pass  # Реализовать при необходимости
     
-    # Определяем тип сообщения
+    # СНАЧАЛА пробуем распарсить как траты через AI (приоритет!)
+    parsed = await ai_parse_expenses(text)
+    logger.info(f"AI parse result: {parsed.get('intent')}, items: {len(parsed.get('items', []))}")
+    
+    if parsed.get("intent") == "expense" and parsed.get("items"):
+        items = parsed["items"]
+        
+        # Проверяем уверенность
+        if parsed.get("confidence", 1) < 0.5 and len(items) == 1:
+            # Низкая уверенность — спрашиваем категорию
+            exp = Expense(
+                amount=items[0]["amount"],
+                currency=items[0].get("currency", "UAH"),
+                description=items[0].get("description", "трата")
+            )
+            user_ctx["last_expense"] = exp
+            user_ctx["pending_action"] = "confirm_category"
+            
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(cat, callback_data=f"cat_{cat}")] 
+                for cat in CATEGORIES
+            ])
+            await update.message.reply_text(
+                f"🤔 *{exp.amount:,.0f} ₴* — {exp.description}\nКакая категория?",
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+            return
+        
+        # Сохраняем траты
+        await process_expenses(update, context, items, text)
+        
+        # Сохраняем в память для обучения
+        for item in items:
+            if item.get("description"):
+                save_memory(chat_id, item["description"].lower(), item.get("category", "Другое"))
+        return  # ВАЖНО: выходим после сохранения трат!
+    
+    # ТОЛЬКО ПОТОМ проверяем другие намерения
     text_lower = text.lower()
     
     # 1. Долги
@@ -1295,13 +1332,15 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
     
-    # 4. Запросы статистики (ключевые слова)
-    if any(kw in text_lower for kw in ["сколько", "статус", "отчёт", "тратил", "потратил", "баланс"]):
-        if any(kw in text_lower for kw in ["недел", "week"]):
-            await show_stats(update, context, "week")
-        else:
-            await show_stats(update, context, "month")
-        return
+    # 4. Запросы статистики (ТОЛЬКО если точно запрос, а не траты)
+    # Убираем "потратил" из ключевых слов для статистики!
+    if any(kw in text_lower for kw in ["сколько", "статус", "отчёт", "баланс", "аналитик"]):
+        if "потратил" not in text_lower and "тратил" not in text_lower:  # Исключаем описание трат
+            if any(kw in text_lower for kw in ["недел", "week"]):
+                await show_stats(update, context, "week")
+            else:
+                await show_stats(update, context, "month")
+            return
     
     # 5. Сравнение
     if any(kw in text_lower for kw in ["сравни", "прошлый", "раньше", "динамика"]):
@@ -1319,106 +1358,16 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         await update.message.reply_text(insight, parse_mode="Markdown")
         return
     
-    # 8. Траты (по умолчанию)
-    parsed = await ai_parse_expenses(text)
+    # 8. Если ничего не подошло — свободный разговор с AI
+    expenses = get_expenses(chat_id, 7)
+    context_data = {
+        "recent_total": sum(float(r["Сумма"]) for r in expenses) if expenses else 0,
+        "has_budget": get_budget_status(chat_id) is not None,
+        "has_salary": get_salary_status(chat_id) is not None
+    }
     
-    if parsed.get("intent") == "expense" and parsed.get("items"):
-        items = parsed["items"]
-        
-        # Проверяем уверенность
-        if parsed.get("confidence", 1) < 0.6 and len(items) == 1:
-            # Низкая уверенность — спрашиваем категорию
-            exp = Expense(
-                amount=items[0]["amount"],
-                currency=items[0].get("currency", "UAH"),
-                description=items[0].get("description", "трата")
-            )
-            user_ctx["last_expense"] = exp
-            user_ctx["pending_action"] = "confirm_category"
-            
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(cat, callback_data=f"cat_{cat}")] 
-                for cat in CATEGORIES
-            ])
-            await update.message.reply_text(
-                f"🤔 *{exp.amount:,.0f} ₴* — {exp.description}\nКакая категория?",
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
-            return
-        
-        # Сохраняем траты
-        await process_expenses(update, context, items, text)
-        
-        # Сохраняем в память для обучения
-        for item in items:
-            if item.get("description"):
-                save_memory(chat_id, item["description"].lower(), item.get("category", "Другое"))
-    else:
-        # Не распознали — свободный разговор с AI
-        # Собираем контекст
-        expenses = get_expenses(chat_id, 7)
-        context_data = {
-            "recent_total": sum(float(r["Сумма"]) for r in expenses) if expenses else 0,
-            "has_budget": get_budget_status(chat_id) is not None,
-            "has_salary": get_salary_status(chat_id) is not None
-        }
-        
-        response = await ai_conversation(text, context_data)
-        await update.message.reply_text(response)
-
-async def process_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE, items: List[Dict], raw_text: str):
-    """Обработка списка трат"""
-    chat_id = update.effective_chat.id
-    lines = ["✅ *Записано!*\n"]
-    total_uah = 0
-    
-    for item in items:
-        # Парсим дату
-        date_str = item.get("date")
-        if date_str:
-            try:
-                exp_date = datetime.fromisoformat(date_str)
-            except:
-                exp_date = parse_smart_date(raw_text)
-        else:
-            exp_date = parse_smart_date(raw_text)
-        
-        # Проверяем память пользователя
-        desc = item.get("description", "трата")
-        mem_cat = get_memory(chat_id, desc.lower())
-        category = mem_cat if mem_cat else item.get("category", "Другое")
-        
-        exp = Expense(
-            amount=float(item.get("amount", 0)),
-            currency=item.get("currency", "UAH"),
-            category=category,
-            description=desc,
-            date=exp_date,
-            raw_text=raw_text
-        )
-        
-        save_expense(exp, chat_id)
-        
-        emoji = CATEGORY_EMOJIS.get(exp.category, "💰")
-        symbol = CURRENCY_SYMBOLS.get(exp.currency, "₴")
-        lines.append(f"{emoji} {exp.description}: *{exp.amount:,.0f} {symbol}* ({exp.category})")
-        
-        if exp.currency == "UAH":
-            total_uah += exp.amount
-    
-    if len(items) > 1:
-        lines.append(f"\n💰 *Итого: {total_uah:,.0f} ₴*")
-    
-    # Проверка бюджета
-    budget = get_budget_status(chat_id)
-    if budget:
-        if budget["status"] == "critical":
-            lines.append(f"\n🔴 *Бюджет на {budget['percent']}%!* Осталось {budget['left']:,.0f} ₴")
-        elif budget["status"] == "warning":
-            lines.append(f"\n🟡 Бюджет использован на {budget['percent']}%")
-    
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    response = await ai_conversation(text, context_data)
+    await update.message.reply_text(response)
 
 # ── HANDLERS ─────────────────────────────────────────────────────────────────
 
@@ -1452,26 +1401,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текста"""
     text = update.message.text
     
-    # Обработка кнопок меню
-    if text == "📊 Статус":
-        await show_stats(update, context, "month")
+    logger.info(f"Handle text: '{text}'")
+    
+    # Обработка кнопок меню (высший приоритет)
+    menu_handlers = {
+        "📊 Статус": lambda: show_stats(update, context, "month"),
+        "📈 Анализ": lambda: show_stats(update, context, "week"),
+        "💸 Долги": lambda: show_debts(update, context),
+        "💡 Совет": lambda: generate_and_send_insight(update, context),
+        "🪞 Сравнение": lambda: show_comparison(update, context),
+        "💸 Привычки": lambda: show_habits(update, context)
+    }
+    
+    if text in menu_handlers:
+        await menu_handlers[text]()
         return
-    if text == "📈 Анализ":
-        await show_stats(update, context, "week")
-        return
-    if text == "💸 Долги":
-        await show_debts(update, context)
-        return
-    if text == "💡 Совет":
-        insight = await generate_ai_insight(update.effective_chat.id)
-        await update.message.reply_text(insight, parse_mode="Markdown")
-        return
-    if text == "🪞 Сравнение":
-        await show_comparison(update, context)
-        return
-    if text == "💸 Привычки":
-        await show_habits(update, context)
-        return
+    
+    # Основная обработка
+    await process_message(update, context, text)
+
+async def generate_and_send_insight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вспомогательная функция для кнопки Совет"""
+    insight = await generate_ai_insight(update.effective_chat.id)
+    await update.message.reply_text(insight, parse_mode="Markdown")
     
     # Основная обработка
     await process_message(update, context, text)
